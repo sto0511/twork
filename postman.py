@@ -4,8 +4,16 @@
 import asyncio
 import time
 import os
+
+# 加载环境变量
+if not os.getenv('GITHUB_ACTIONS'):
+    from dotenv import load_dotenv
+    load_dotenv(dotenv_path='.29614663.env')
+
+
 import random
 import re
+import json
 from datetime import datetime
 from telethon import TelegramClient
 from telethon.tl.types import MessageMediaWebPage
@@ -13,9 +21,13 @@ from telethon.tl.types import InputMessagesFilterEmpty
 from peewee import DoesNotExist
 
 from model.scrap_progress import ScrapProgress
+from model.scrap_config import ScrapConfig
 from database import db
 
+
+
 from handlers.HandlerBJIClass import HandlerBJIClass
+from handlers.HandlerBJILiteClass import HandlerBJILiteClass
 from handlers.HandlerNoAction import HandlerNoAction
 from handlers.HandlerRelayClass import HandlerRelayClass
 
@@ -27,12 +39,13 @@ from telethon.tl.functions.photos import DeletePhotosRequest
 from telethon.tl.types import InputPhoto
 from telethon.tl.functions.account import UpdateProfileRequest
 from telethon.tl.functions.account import UpdateUsernameRequest
+from telethon.tl.functions.channels import InviteToChannelRequest, TogglePreHistoryHiddenRequest,LeaveChannelRequest
 from telethon.errors import ChannelPrivateError
 
-# 加载环境变量
-if not os.getenv('GITHUB_ACTIONS'):
-    from dotenv import load_dotenv
-    load_dotenv(dotenv_path='.25254811.env')
+
+
+
+
 
 # 配置参数
 config = {
@@ -41,13 +54,37 @@ config = {
     'phone_number': os.getenv('PHONE_NUMBER'),
     'session_name': os.getenv('API_ID') + 'session_name',
     'setting_chat_id': int(os.getenv('SETTING_CHAT_ID', '0')),
-    'setting_thread_id': int(os.getenv('SETTING_THREAD_ID', '0'))
+    'setting_thread_id': int(os.getenv('SETTING_THREAD_ID', '0')),
+    'setting' : os.getenv('CONFIGURATION', '')
 }
+
+
+
+
+
+# 嘗試載入 JSON 並合併參數
+try:
+    setting_json = json.loads(config['setting'])
+    if isinstance(setting_json, dict):
+        config.update(setting_json)  # 將 JSON 鍵值對合併到 config 中
+except Exception as e:
+    print(f"⚠️ 無法解析 CONFIGURATION：{e}")
+        
+print(f"⚠️ 配置參數：{config}")
+   
+
+    
+    
+
+
 
 # 在模块顶部初始化全局缓存
 local_scrap_progress = {}  # key = (chat_id, api_id), value = message_id
 
 last_message_id = 0
+
+# 黑名单缓存
+blacklist_entity_ids = set()
 
 # 初始化 Telegram 客户端
 client = TelegramClient(config['session_name'], config['api_id'], config['api_hash'])
@@ -68,6 +105,22 @@ async def join(invite_hash):
         else:
             print(f"加入群组失败: {e}")
 
+async def leave_group(entity):
+    try:
+        await client(LeaveChannelRequest(channel=entity))
+        print(f'✅ 已退出群组/频道: {getattr(entity, "title", entity.id)}')
+    except Exception as e:
+        print(f'❌ 退出失败: {e}')
+
+async def open_chat_history(entity):
+    try:
+        result = await client(TogglePreHistoryHiddenRequest(
+            channel=entity,
+            enabled=False  # False = 允许新成员查看历史记录
+        ))
+        print(f'✅ 已开启历史记录可见: {result}')
+    except Exception as e:
+        print(f'❌ 操作失败: {e}')
 
 async def delete_my_profile_photos(client):
     photos = await client.get_profile_photos('me')
@@ -99,18 +152,38 @@ async def update_username(client,username):
     except Exception as e:
         print(f"变更失败：{e}")
 
+
+async def invite_bot(bot_username, entity):
+# 获取 Bot 实体
+    bot_entity = await client.get_entity(bot_username)
+    # 邀请 Bot 到超级群
+    try:
+        await client.send_message(bot_username, '/start')
+        await client.send_message(bot_username, 'Hello')
+        await client(InviteToChannelRequest(
+            channel=entity,
+            users=[bot_entity]
+        ))
+        print(f'已邀请 @{bot_username} 进入本群')
+
+        # 检查是否真的在群里
+        participants = await client.get_participants(entity)
+        if any(p.username and p.username.lower() == bot_username.lower() for p in participants):
+            print(f'✅ 确认 @{bot_username} 已经加入')
+        else:
+            print(f'⚠️ @{bot_username} 似乎没有加入，可能已被踢出或受限')
+
+    except Exception as e:
+        print(f'邀请失败: {e}')
+
+
+
 async def safe_delete_message(message):
     try:
         await client.delete_messages(message.chat_id, [message.id], revoke=True)
-        print(f"🧹 成功刪除訊息 {message.id}（雙方）", flush=True)
+        print(f"🧹 成功刪除訊息A {message.id}（雙方）", flush=True)
     except Exception as e:
-        print(f"⚠️ 刪除訊息失敗 {message.id}：{e}", flush=True)
-
-
-
-
-
-
+        print(f"⚠️ 刪除訊息失敗A {message.id}：{e}", flush=True)
 
 async def keep_db_alive():
     if db.is_closed():
@@ -133,9 +206,36 @@ async def send_completion_message(last_message_id):
         print("未设置配置线程 ID，无法发送完成消息。")
         pass
 
+async def is_blacklisted(entity_id):
+    global blacklist_entity_ids
+
+    # ✅ 先查缓存
+    if entity_id in blacklist_entity_ids:
+        return True
+
+    # ✅ 先尝试从 ScrapConfig 取黑名单
+    try:
+        record = ScrapConfig.get(
+            (ScrapConfig.api_id == config['api_id']) &
+            (ScrapConfig.title == 'BLACKLIST_IDS')
+        )
+        raw = record.value or ''
+        
+        ids = {int(x.strip()) for x in raw.split(',') if x.strip().isdigit()}
+        blacklist_entity_ids.update(ids)  # 缓存
+
+        return entity_id in blacklist_entity_ids
+    except DoesNotExist:
+        blacklist_entity_ids = set()
+        # print("⚠️ scrap_config 中找不到 BLACKLIST_IDS")
+        return False
+    except Exception as e:
+        print(f"⚠️ 加载黑名单失败: {e}")
+        return False
+
+
 async def get_max_source_message_id(source_chat_id):
     key = (source_chat_id, config['api_id'])
-
     if key in local_scrap_progress:
         return local_scrap_progress[key]
 
@@ -161,9 +261,10 @@ async def get_max_source_message_id(source_chat_id):
     except Exception as e:
         print(f"Error fetching max source_message_id: {e}")
         return None
-    
 
 
+
+        
 async def save_scrap_progress(entity_id, message_id):
     key = (entity_id, config['api_id'])
     record = ScrapProgress.get_or_none(
@@ -188,34 +289,76 @@ async def save_scrap_progress(entity_id, message_id):
 
     local_scrap_progress[key] = message_id  # ✅ 同步更新缓存
 
-async def process_user_message(client, entity, message):
+async def process_user_message(entity, message):
 
     botname = None
-    try:
-        if message.text:
+
+    if message.text:
+        try:
             match = re.search(r'\|_kick_\|\s*(.*?)\s*(bot)', message.text, re.IGNORECASE)
             if match:
                 botname = match.group(1) + match.group(2)
                 await client.send_message(botname, "/start")
                 await client.send_message(botname, "[~bot~]")
-    except Exception as e:
-        print(f"Error kicking bot: {e} {botname}", flush=True)
+                return
+        except Exception as e:
+                print(f"Error kicking bot: {e} {botname}", flush=True)
 
-    extra_data = {'app_id': config['api_id']}
 
+        try:
+            #  |_ask_|4234@vampire666666666
+            match = re.search(r'\|_ask_\|(\d+)@([-\w]+)', message.text, re.IGNORECASE)
+            if match:
+                # sort_content_id = match.group(1)
+                # request_bot_name = match.group(2)
+                send_msg = await client.send_message('@ztdthumb011bot', message.text)
+                # 删除消息
+                await safe_delete_message(send_msg)
+                await safe_delete_message(message)
+                return
+
+        except Exception as e:
+                print(f"Error kicking bot: {e} {botname}", flush=True)
+
+        #  |_join_|QQCyh1N2sMU5ZGQ0
+
+        try:
+            inviteurl = None
+            match2 = re.search(r'\|_join_\|(.*)', message.text, re.IGNORECASE)
+            if match2:
+                inviteurl = match2.group(1) 
+                print(f"邀请链接: {inviteurl}")
+                await join(inviteurl)    #Coniguration
+                return
+        except Exception as e:
+                print(f"Error livite: {e} {inviteurl}", flush=True)
    
+
+    # # 打印来源
+    # first_name = getattr(entity, "first_name", "") or ""
+    # last_name = getattr(entity, "last_name", "") or ""
+    # entity_title = f"{first_name} {last_name}".strip()
+    # # print(f"[User] Message from {entity_title} ({self.entity.id}): {self.message.text}")
+    # print(f"\r\n[User] Message from {entity_title} ({entity.id}): {message.id}")
+
+    extra_data = {'app_id': config['api_id'],'config': config}
+
+    # 如果 config 中 is_debug_enabled 有值, 且為 1, 則 pass
+    if config.get('bypass_private_check') == 1:
+        print(f"⚠️ bypass_private_check: {config.get('bypass_private_check')}")
+        return
 
     # 实现：根据 entity.id 映射到不同处理类
     class_map = {
         777000: HandlerNoAction,   # 替换为真实 entity.id 和处理类
         7419440827: HandlerNoAction,    #萨莱
         8076535891: HandlerNoAction    #岩仔
-
     }
 
     handler_class = class_map.get(entity.id)
     if handler_class:
         handler = handler_class(client, entity, message, extra_data)
+        handler.is_duplicate_allowed = True
         await handler.handle()
     else:
         
@@ -223,36 +366,76 @@ async def process_user_message(client, entity, message):
         # handler = HandlerNoAction(client, entity, message, extra_data)
         handler.delete_after_process = True
         await handler.handle()
-        # print(f"[Group] Message from {entity_title} ({entity.id}): {message.text}")
+       
        
 
-async def process_group_message(client, entity, message):
+async def process_group_message(entity, message):
     
     extra_data = {'app_id': config['api_id']}
 
-   
 
+    # 检测是否是 |_init_|
+    if message.text == '|_init_|':
+        await invite_bot('luzai01bot', entity)  # 替换为实际的 Bot 用户名
+        await invite_bot('has_no_access_bot', entity)  # 替换为实际的 Bot 用户名
+        await invite_bot('DeletedAcconutBot', entity)  # 替换为实际的 Bot 用户名
+        await invite_bot('freebsd66bot', entity)  # 替换为实际的 Bot 用户名
+        await safe_delete_message(message)
+        await open_chat_history(entity)
+        await client.send_message(entity.id, f"entity.id: {str(entity.id)}"  )
+        await leave_group(entity)
+
+        return
+            
     # 实现：根据 entity.id 映射到不同处理类
     class_map = {
         2210941198: HandlerBJIClass,   # 替换为真实 entity.id 和处理类
-        2054963513: HandlerRelayClass
+        # 2210941198: HandlerBJILiteClass,   # 替换为真实 entity.id 和处理类
+        2054963513: HandlerRelayClass,
+        # 2030683460: HandlerNoAction,        #Configuration
+       
     }
 
-    
+   
+    # entity_title = getattr(entity, 'title', f"Unknown entity {entity.id}")
+    # print(f"[Group-X] Message from {entity_title} ({entity.id}): {message.text}")
     
 
     handler_class = class_map.get(entity.id)
     if handler_class:
+
+       
+
         handler = handler_class(client, entity, message, extra_data)
-        handler.accept_duplicate = True
+        handler.is_duplicate_allowed = True
         await handler.handle()
+
+
     else:
         pass
 
-async def man_bot_loop(client):
+
+
+async def man_bot_loop():
     last_message_id = 0  # 提前定义，避免 UnboundLocalError
     async for dialog in client.iter_dialogs():
         entity = dialog.entity
+
+        # if entity.id != 5486047924:
+        #     continue
+
+        # ✅ 跳过黑名单
+        if await is_blacklisted(entity.id):
+            # print(f"🚫 已屏蔽 entity: {entity.id}，跳过处理")
+            continue
+
+        entity_title = getattr(entity, 'title', None)
+        if not entity_title:
+            first_name = getattr(entity, 'first_name', '') or ''
+            last_name = getattr(entity, 'last_name', '') or ''
+            entity_title = f"{first_name} {last_name}".strip() or "Unknown"
+
+        print(f"当前对话: {entity_title} ({entity.id})", flush=True)
 
         if dialog.unread_count >= 0:
             if dialog.is_user:
@@ -260,10 +443,11 @@ async def man_bot_loop(client):
                 max_message_id = await get_max_source_message_id(entity.id)
                 min_id = max_message_id if max_message_id else 1
                 async for message in client.iter_messages(
-                    entity, min_id=min_id, limit=1, reverse=True, filter=InputMessagesFilterEmpty()
+                    entity, min_id=min_id, limit=100, reverse=True, filter=InputMessagesFilterEmpty()
                 ):
                     current_message = message
-                    await process_user_message(client, entity, message)
+                    
+                    await process_user_message(entity, message)
 
                 if current_message:
                     await save_scrap_progress(entity.id, current_message.id)
@@ -273,20 +457,21 @@ async def man_bot_loop(client):
                 
                 
             else:
-               
+                
                 current_message = None
                 max_message_id = await get_max_source_message_id(entity.id)
                 min_id = max_message_id if max_message_id else 1
 
                 try:
                     async for message in client.iter_messages(
-                        entity, min_id=min_id, limit=100, reverse=True, filter=InputMessagesFilterEmpty()
+                        entity, min_id=min_id, limit=500, reverse=True, filter=InputMessagesFilterEmpty()
                     ):
                         
                         if message.sticker:
                             continue
                         current_message = message
-                        await process_group_message(client, entity, message)
+                        # print(f"当前消息ID(G): {current_message.id}")
+                        await process_group_message(entity, message)
                 except ChannelPrivateError as e:
                     print(f"目标 entity: {entity} 类型：{type(entity)}")
                     print(f"❌ 无法访问频道：{e}")
@@ -300,51 +485,77 @@ async def man_bot_loop(client):
                 if current_message:
                     await save_scrap_progress(entity.id, current_message.id)
                     return last_message_id
-
+    return last_message_id
 
 
 
 async def main():
     await client.start(config['phone_number'])
-    # await update_username(client,"usesrnddzzzame")
-   
-    # await join("Dya4zqIBXtIxMWZk") #6874-01 2017145941
-    # await join("fTMvarjGSckxZmI8") #7258-02 2091886937 v
-    # await join("aLUZCCIiKhM5ZWNk") #7275-03 2063167161
-    # await join("cr_hRjB_dRtkODdk") #7287-04 2108982395
-    # await join("AeW96FZ9pmZTdk") #6376-05 1997235289
-    # await join("li2wwjC6vEc5Mzdk") #6659-06   2000730581
-    # await join("YfssBV1GmsgzMWQ0")  #7350-07 2145325974
-    # await join("AWkBJsoFUc81MWE1")  #5891-08 2062860209
-    # await join("_nPFKXIaMns1OTQ0")  #7338-09 2015918658
-    # await join("Y7KzLjhksH82ZmM8")  #06315-10 2116379337 @shunfeng807
-    # await join("5vQRdy9O4AxhZWQ8")  #06393-11 2064531407    @shunfeng807
+    await keep_db_alive()
+
+    me = await client.get_me()
+    print(f'你的用户名: {me.username}')
+    print(f'你的ID: {me.id}')
+    print(f'你的名字: {me.first_name} {me.last_name or ""}')
+    print(f'是否是Bot: {me.bot}')
+
+
+    # group_identifier = -1002592636499
+    # participants = await client.get_participants(group_identifier)
+
+    # # 遍历输出用户名和 ID
+    # for user in participants:
+    #     sql = f"INSERT INTO pure (user_id, done) VALUES ({user.id}, 0);"
+    #     print(sql)
+    #     db.execute_sql(sql)
+    #     # 插入数据库 INSERT INTO `pure` (`user_id`, `done`) VALUES ('user.id', '0');
+
+
+    # exit()
+    # await delete_my_profile_photos(client)
+    # await update_username(client,"gunndd8kdhdj")
+    # exit()
+
+    # await join("Dya4zqIBXtIxMWZk") #6874-01 2017145941    - 22329346  / 20100034
+    # await join("fTMvarjGSckxZmI8") #7258-02 2091886937 ok
+    # await join("aLUZCCIiKhM5ZWNk") #7275-03 2063167161    -22329346   / 20100034
+    # await join("cr_hRjB_dRtkODdk") #7287-04 2108982395 - 20100034
+    # await join("AeW96FZ9pmZTdk") #6376-05 1997235289  - 22329346  / 20100034
+    # await join("li2wwjC6vEc5Mzdk") #6659-06   2000730581 - 22329346   / 20100034
+    # await join("YfssBV1GmsgzMWQ0")  #7350-07 2145325974 / 20100034
+    # await join("AWkBJsoFUc81MWE1")  #5891-08 2062860209 / 20100034
+    # await join("_nPFKXIaMns1OTQ0")  #7338-09 2015918658 / 20100034
+    # await join("3eDZvSPvkVgyNmY0")  #06315-10 2047726819 v ok shunfeng807
+    # await join("3eDZvSPvkVgyNmY0")  #06393-11 2003243227 v   @shunfeng807
     # await join("JP4ToOui4FcyMzM0")  #6463-12   1843229948
-    # await join("PsKjngKmHXtlNTM0")  #7246-13   2021739085
+    # await join("PsKjngKmHXtlNTM0")  #7246-13   2021739085 v
 
-    # await join("fRCAnbinkG1hYjU0")  #封面备份群   2086579883
-    # await join("6gAolpGeQq8wYmM0")  #封面图中转站 2054963513
+    # await join("fRCAnbinkG1hYjU0")  #封面备份群   2086579883  #setting: thumb, func: handle_bid(update_thumb_info_by_send_photo), get_thumb
+    # await join("6gAolpGeQq8wYmM0")  #封面图中转站 2054963513  Relay #setting: photo_relay , func: process_update_sora_thumb_info,push_notification_action
 
 
-    
+    # |_join_|3eDZvSPvkVgyNmY0
+
     
     
     
   
   
     # await join("xbY8S-04jnEzYWE0")   
-    # await join("7-HhTojcPCYyMjk0")    #Coniguration
-
+    
+    
     start_time = time.time()
     # 显示现在时间
     now = datetime.now()
     print(f"Current: {now.strftime('%Y-%m-%d %H:%M:%S')}",flush=True)
 
     while (time.time() - start_time) < MAX_PROCESS_TIME:
-        last_message_id = await man_bot_loop(client)
-        # await keep_db_alive()
-        # print("--- Cycle End ---")
-        await asyncio.sleep(random.randint(14, 30))
+        try:
+            last_message_id = await asyncio.wait_for(man_bot_loop(), timeout=300)  # 5分钟超时
+        except asyncio.TimeoutError:
+            print("⚠️ 任务超时，跳过本轮", flush=True)
+        # await asyncio.sleep(random.randint(5, 10))
+       
 
     await send_completion_message(last_message_id)
 

@@ -230,9 +230,9 @@ async def remove_username(client):
 async def safe_delete_message(message):
     try:
         await client.delete_messages(message.chat_id, [message.id], revoke=True)
-        print(f"🧹 成功刪除訊息 {message.id}（雙方）", flush=True)
+        print(f"🧹 成功刪除訊息B {message.id}（雙方）", flush=True)
     except Exception as e:
-        print(f"⚠️ 刪除訊息失敗 {message.id}：{e}", flush=True)
+        print(f"⚠️ 刪除訊息失敗B {message.id}：{e}", flush=True)
 
 
 async def main():
@@ -245,7 +245,7 @@ async def main():
 
     # await join("7-HhTojcPCYyMjk0")    #Coniguration
     # await join("0pHeNq5WfXAxYjU8")    #SHELLBOT_FORWARD_CHAT_ID
-    # await join("CX9jBUmJ92A4YTQ0")    #FILEDEPOT_FORWARD_CHAT_IDFILEDEPOT_FORWARD_CHAT_ID
+    # await join("CX9jBUmJ92A4YTQ0")    #FILEDEPOT_FORWARD_CHAT_ID
     # await join("xbY8S-04jnEzYWE0")    #PROTECT_FILEDEPOT_FORWARD_CHAT_ID
    
     # await client.send_message(2089623619, "章鱼哥还没好吗")  # 替换为实际的 bot ID
